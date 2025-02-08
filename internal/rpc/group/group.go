@@ -16,6 +16,7 @@ package group
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/openimsdk/open-im-server/v3/pkg/rpcli"
 	"math/big"
@@ -201,6 +202,10 @@ func (g *groupServer) GenGroupID(ctx context.Context, groupID *string) error {
 }
 
 func (g *groupServer) CreateGroup(ctx context.Context, req *pbgroup.CreateGroupReq) (*pbgroup.CreateGroupResp, error) {
+	if !authverify.IsAppManagerUid(ctx, g.config.Share.IMAdminUserID) {
+		return nil, errs.ErrNoPermission.WrapMsg("only app manager can create group")
+	}
+
 	if req.GroupInfo.GroupType != constant.WorkingGroup {
 		return nil, errs.ErrArgs.WrapMsg(fmt.Sprintf("group type only supports %d", constant.WorkingGroup))
 	}
@@ -228,6 +233,27 @@ func (g *groupServer) CreateGroup(ctx context.Context, req *pbgroup.CreateGroupR
 	if len(userMap) != len(userIDs) {
 		return nil, servererrs.ErrUserIDNotFound.WrapMsg("user not found")
 	}
+
+	groupEx := model.NewGroupEx()
+	if req.GroupInfo.Ex != "" {
+		if err := json.Unmarshal([]byte(req.GroupInfo.Ex), groupEx); err != nil {
+			return nil, errs.ErrArgs.WrapMsg("invalid group ex format")
+		}
+		groupEx.RemainingCap = int(float64(groupEx.Capacity) * 1.1)
+	}
+
+	totalMembers := len(userIDs)
+	if totalMembers > groupEx.RemainingCap {
+		return nil, errs.ErrArgs.WrapMsg(fmt.Sprintf("group member count %d exceeds remaining capacity %d", totalMembers, groupEx.RemainingCap))
+	}
+
+	groupEx.RemainingCap -= totalMembers
+
+	exBytes, err := json.Marshal(groupEx)
+	if err != nil {
+		return nil, err
+	}
+	req.GroupInfo.Ex = string(exBytes)
 
 	if err := g.webhookBeforeCreateGroup(ctx, &g.config.WebhooksConfig.BeforeCreateGroup, req); err != nil && err != servererrs.ErrCallbackContinue {
 		return nil, err
@@ -392,6 +418,34 @@ func (g *groupServer) InviteUserToGroup(ctx context.Context, req *pbgroup.Invite
 		if err := g.PopulateGroupMember(ctx, groupMember); err != nil {
 			return nil, err
 		}
+	}
+
+	groupEx := model.NewGroupEx()
+	if group.Ex != "" {
+		if err := json.Unmarshal([]byte(group.Ex), groupEx); err != nil {
+			return nil, errs.ErrArgs.WrapMsg("invalid group ex format")
+		}
+	}
+
+	currentMembers, err := g.db.FindGroupMemberNum(ctx, req.GroupID)
+	if err != nil {
+		return nil, err
+	}
+
+	maxMembers := int(float64(groupEx.Capacity) * 1.1)
+	newMemberCount := len(req.InvitedUserIDs)
+	if int(currentMembers)+newMemberCount > maxMembers {
+		return nil, errs.ErrArgs.WrapMsg(fmt.Sprintf("adding %d members would exceed maximum capacity %d", newMemberCount, maxMembers))
+	}
+
+	groupEx.RemainingCap -= newMemberCount
+
+	exBytes, err := json.Marshal(groupEx)
+	if err != nil {
+		return nil, err
+	}
+	if err := g.db.UpdateGroup(ctx, group.GroupID, map[string]interface{}{"ex": string(exBytes)}); err != nil {
+		return nil, err
 	}
 
 	if err := g.webhookBeforeInviteUserToGroup(ctx, &g.config.WebhooksConfig.BeforeInviteUserToGroup, req); err != nil && err != servererrs.ErrCallbackContinue {
@@ -850,6 +904,23 @@ func (g *groupServer) JoinGroup(ctx context.Context, req *pbgroup.JoinGroupReq) 
 		return nil, servererrs.ErrDismissedAlready.Wrap()
 	}
 
+	groupEx := model.NewGroupEx()
+	if group.Ex != "" {
+		if err := json.Unmarshal([]byte(group.Ex), groupEx); err != nil {
+			return nil, errs.ErrArgs.WrapMsg("invalid group ex format")
+		}
+	}
+
+	currentMembers, err := g.db.FindGroupMemberNum(ctx, req.GroupID)
+	if err != nil {
+		return nil, err
+	}
+
+	maxMembers := int(float64(groupEx.Capacity) * 1.1)
+	if int(currentMembers) >= maxMembers {
+		return nil, errs.ErrArgs.WrapMsg(fmt.Sprintf("group has reached maximum capacity %d", maxMembers))
+	}
+
 	reqCall := &callbackstruct.CallbackJoinGroupReq{
 		GroupID:    req.GroupID,
 		GroupType:  string(group.GroupType),
@@ -1157,6 +1228,34 @@ func (g *groupServer) SetGroupInfoEx(ctx context.Context, req *pbgroup.SetGroupI
 	}
 
 	g.webhookAfterSetGroupInfoEx(ctx, &g.config.WebhooksConfig.AfterSetGroupInfoEx, req)
+
+	if group.Ex != "" && req.Ex != nil {
+		oldGroupEx := model.NewGroupEx()
+		if err := json.Unmarshal([]byte(group.Ex), oldGroupEx); err != nil {
+			return nil, errs.ErrArgs.WrapMsg("invalid old group ex format")
+		}
+
+		newGroupEx := model.NewGroupEx()
+		if err := json.Unmarshal([]byte(req.Ex.Value), newGroupEx); err != nil {
+			return nil, errs.ErrArgs.WrapMsg("invalid new group ex format")
+		}
+
+		// 计算容量差值并更新剩余容量
+		if newGroupEx.Capacity != oldGroupEx.Capacity {
+			capacityDiff := newGroupEx.Capacity - oldGroupEx.Capacity
+			newGroupEx.RemainingCap = oldGroupEx.RemainingCap + capacityDiff
+			// 为新容量提供额外10%空间
+			extraCap := int(float64(capacityDiff) * 0.1)
+			newGroupEx.RemainingCap += extraCap
+
+			// 更新Ex字段
+			exBytes, err := json.Marshal(newGroupEx)
+			if err != nil {
+				return nil, err
+			}
+			req.Ex.Value = string(exBytes)
+		}
+	}
 
 	return &pbgroup.SetGroupInfoExResp{}, nil
 }
