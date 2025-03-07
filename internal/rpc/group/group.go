@@ -425,25 +425,15 @@ func (g *groupServer) InviteUserToGroup(ctx context.Context, req *pbgroup.Invite
 		}
 	}
 
-	currentMembers, err := g.db.FindGroupMemberNum(ctx, req.GroupID)
-	if err != nil {
-		return nil, err
+	for _, userID := range req.InvitedUserIDs {
+		if datautil.Contain(userID, groupEx.Blacklist...) {
+			return nil, errs.ErrNoPermission.WrapMsg(fmt.Sprintf("user %s in group blacklist", userID))
+		}
 	}
 
-	maxMembers := int(float64(groupEx.Capacity) * 1.1)
 	newMemberCount := len(req.InvitedUserIDs)
-	if int(currentMembers)+newMemberCount > maxMembers {
-		return nil, errs.ErrArgs.WrapMsg(fmt.Sprintf("adding %d members would exceed maximum capacity %d", newMemberCount, maxMembers))
-	}
-
-	groupEx.RemainingCap -= newMemberCount
-
-	exBytes, err := json.Marshal(groupEx)
-	if err != nil {
-		return nil, err
-	}
-	if err := g.db.UpdateGroup(ctx, group.GroupID, map[string]interface{}{"ex": string(exBytes)}); err != nil {
-		return nil, err
+	if newMemberCount > groupEx.RemainingCap {
+		return nil, errs.ErrArgs.WrapMsg(fmt.Sprintf("adding %d members would exceed remaining capacity %d", newMemberCount, groupEx.RemainingCap))
 	}
 
 	if err := g.webhookBeforeInviteUserToGroup(ctx, &g.config.WebhooksConfig.BeforeInviteUserToGroup, req); err != nil && err != servererrs.ErrCallbackContinue {
@@ -479,6 +469,16 @@ func (g *groupServer) InviteUserToGroup(ctx context.Context, req *pbgroup.Invite
 			}
 		}
 	}
+
+	groupEx.RemainingCap -= newMemberCount
+	exBytes, err := json.Marshal(groupEx)
+	if err != nil {
+		return nil, err
+	}
+	if err := g.db.UpdateGroup(ctx, group.GroupID, map[string]interface{}{"ex": string(exBytes)}); err != nil {
+		return nil, err
+	}
+
 	var groupMembers []*model.GroupMember
 	for _, userID := range req.InvitedUserIDs {
 		member := &model.GroupMember{
@@ -874,6 +874,23 @@ func (g *groupServer) GroupApplicationResponse(ctx context.Context, req *pbgroup
 	}
 	switch req.HandleResult {
 	case constant.GroupResponseAgree:
+		groupEx := model.NewGroupEx()
+		if group.Ex != "" {
+			if err := json.Unmarshal([]byte(group.Ex), groupEx); err != nil {
+				return nil, errs.ErrArgs.WrapMsg("invalid group ex format")
+			}
+		}
+		if groupEx.RemainingCap < 1 {
+			return nil, errs.ErrArgs.WrapMsg("group has reached maximum capacity")
+		}
+		groupEx.RemainingCap -= 1
+		exBytes, err := json.Marshal(groupEx)
+		if err != nil {
+			return nil, err
+		}
+		if err := g.db.UpdateGroup(ctx, group.GroupID, map[string]interface{}{"ex": string(exBytes)}); err != nil {
+			return nil, err
+		}
 		g.notification.GroupApplicationAcceptedNotification(ctx, req)
 		if member == nil {
 			log.ZDebug(ctx, "GroupApplicationResponse", "member is nil")
@@ -915,14 +932,12 @@ func (g *groupServer) JoinGroup(ctx context.Context, req *pbgroup.JoinGroupReq) 
 		}
 	}
 
-	currentMembers, err := g.db.FindGroupMemberNum(ctx, req.GroupID)
-	if err != nil {
-		return nil, err
+	if datautil.Contain(req.InviterUserID, groupEx.Blacklist...) {
+		return nil, errs.ErrNoPermission.WrapMsg("user in group blacklist")
 	}
 
-	maxMembers := int(float64(groupEx.Capacity) * 1.1)
-	if int(currentMembers) >= maxMembers {
-		return nil, errs.ErrArgs.WrapMsg(fmt.Sprintf("group has reached maximum capacity %d", maxMembers))
+	if groupEx.RemainingCap < 1 {
+		return nil, errs.ErrArgs.WrapMsg("group has reached maximum capacity")
 	}
 
 	reqCall := &callbackstruct.CallbackJoinGroupReq{
@@ -945,6 +960,15 @@ func (g *groupServer) JoinGroup(ctx context.Context, req *pbgroup.JoinGroupReq) 
 	}
 	log.ZDebug(ctx, "JoinGroup.groupInfo", "group", group, "eq", group.NeedVerification == constant.Directly)
 	if group.NeedVerification == constant.Directly {
+		groupEx.RemainingCap -= 1
+		exBytes, err := json.Marshal(groupEx)
+		if err != nil {
+			return nil, err
+		}
+		if err := g.db.UpdateGroup(ctx, group.GroupID, map[string]interface{}{"ex": string(exBytes)}); err != nil {
+			return nil, err
+		}
+
 		groupMember := &model.GroupMember{
 			GroupID:        group.GroupID,
 			UserID:         user.UserID,
@@ -1122,8 +1146,9 @@ func (g *groupServer) SetGroupInfo(ctx context.Context, req *pbgroup.SetGroupInf
 
 func (g *groupServer) SetGroupInfoEx(ctx context.Context, req *pbgroup.SetGroupInfoExReq) (*pbgroup.SetGroupInfoExResp, error) {
 	var opMember *model.GroupMember
+	isAppManagerUid := authverify.IsAppManagerUid(ctx, g.config.Share.IMAdminUserID)
 
-	if !authverify.IsAppManagerUid(ctx, g.config.Share.IMAdminUserID) {
+	if !isAppManagerUid {
 		var err error
 
 		opMember, err = g.db.TakeGroupMember(ctx, req.GroupID, mcontext.GetOpUserID(ctx))
@@ -1150,6 +1175,177 @@ func (g *groupServer) SetGroupInfoEx(ctx context.Context, req *pbgroup.SetGroupI
 	}
 	if group.Status == constant.GroupStatusDismissed {
 		return nil, servererrs.ErrDismissedAlready.Wrap()
+	}
+
+	if req.Ex != nil {
+		oldGroupEx := model.NewGroupEx()
+		if group.Ex != "" {
+			if err := json.Unmarshal([]byte(group.Ex), oldGroupEx); err != nil {
+				return nil, errs.ErrArgs.WrapMsg("invalid old group ex format")
+			}
+		}
+
+		newGroupEx := model.NewGroupEx()
+		if err := json.Unmarshal([]byte(req.Ex.Value), newGroupEx); err != nil {
+			return nil, errs.ErrArgs.WrapMsg("invalid new group ex format")
+		}
+
+		// 处理群组封禁操作标志
+		var banOperation string
+		var banMap map[string]interface{}
+		if err := json.Unmarshal([]byte(req.Ex.Value), &banMap); err == nil {
+			if ban, ok := banMap["banOperation"]; ok {
+				if banStr, ok := ban.(string); ok {
+					banOperation = banStr
+				}
+			}
+		}
+
+		// 根据封禁操作标志修改群组状态
+		if banOperation == "ban" {
+			// 封禁群组，将状态修改为 GroupBanChat
+			if err := g.db.UpdateGroup(ctx, req.GroupID, UpdateGroupStatusMap(constant.GroupBanChat)); err != nil {
+				return nil, err
+			}
+
+			// 获取群组信息和操作者信息，用于发送通知
+			updatedGroup, err := g.db.TakeGroup(ctx, req.GroupID)
+			if err != nil {
+				return nil, err
+			}
+
+			count, err := g.db.FindGroupMemberNum(ctx, updatedGroup.GroupID)
+			if err != nil {
+				return nil, err
+			}
+
+			owner, err := g.db.TakeGroupOwner(ctx, updatedGroup.GroupID)
+			if err != nil {
+				return nil, err
+			}
+
+			if err := g.PopulateGroupMember(ctx, owner); err != nil {
+				return nil, err
+			}
+
+			// 创建通知内容
+			tips := &sdkws.GroupInfoSetTips{
+				Group:    g.groupDB2PB(updatedGroup, owner.UserID, count),
+				MuteTime: 0,
+				OpUser:   &sdkws.GroupMemberFullInfo{},
+			}
+
+			if opMember != nil {
+				tips.OpUser = g.groupMemberDB2PB(opMember, 0)
+			}
+
+			// 发送群组封禁通知
+			g.notification.GroupInfoSetNotification(ctx, tips)
+
+		} else if banOperation == "unban" {
+			// 解封群组，将状态修改为 GroupOk
+			if err := g.db.UpdateGroup(ctx, req.GroupID, UpdateGroupStatusMap(constant.GroupOk)); err != nil {
+				return nil, err
+			}
+
+			// 获取群组信息和操作者信息，用于发送通知
+			updatedGroup, err := g.db.TakeGroup(ctx, req.GroupID)
+			if err != nil {
+				return nil, err
+			}
+
+			count, err := g.db.FindGroupMemberNum(ctx, updatedGroup.GroupID)
+			if err != nil {
+				return nil, err
+			}
+
+			owner, err := g.db.TakeGroupOwner(ctx, updatedGroup.GroupID)
+			if err != nil {
+				return nil, err
+			}
+
+			if err := g.PopulateGroupMember(ctx, owner); err != nil {
+				return nil, err
+			}
+
+			// 创建通知内容
+			tips := &sdkws.GroupInfoSetTips{
+				Group:    g.groupDB2PB(updatedGroup, owner.UserID, count),
+				MuteTime: 0,
+				OpUser:   &sdkws.GroupMemberFullInfo{},
+			}
+
+			if opMember != nil {
+				tips.OpUser = g.groupMemberDB2PB(opMember, 0)
+			}
+
+			// 发送群组解封通知
+			g.notification.GroupInfoSetNotification(ctx, tips)
+		}
+
+		if !isAppManagerUid {
+			newGroupEx.MaxAdminNum = oldGroupEx.MaxAdminNum
+		} else if newGroupEx.MaxAdminNum != oldGroupEx.MaxAdminNum {
+			currentAdmins, err := g.db.FindGroupMemberRoleLevels(ctx, req.GroupID, []int32{constant.GroupAdmin})
+			if err != nil {
+				return nil, err
+			}
+			if len(currentAdmins) > newGroupEx.MaxAdminNum {
+				return nil, errs.ErrArgs.WrapMsg(fmt.Sprintf("new max admin number %d is less than current admin count %d", newGroupEx.MaxAdminNum, len(currentAdmins)))
+			}
+		}
+
+		currentMembers, err := g.db.FindGroupMemberNum(ctx, group.GroupID)
+		if err != nil {
+			return nil, err
+		}
+
+		if !isAppManagerUid {
+			newGroupEx.Capacity = oldGroupEx.Capacity
+			newGroupEx.RemainingCap = oldGroupEx.RemainingCap
+		} else if newGroupEx.Capacity != oldGroupEx.Capacity {
+			if newGroupEx.Capacity < oldGroupEx.Capacity {
+				newRemainingCap := int(float64(newGroupEx.Capacity)*1.1) - int(currentMembers)
+				if newRemainingCap < 0 {
+					return nil, errs.ErrArgs.WrapMsg("new capacity is too small for current member count")
+				}
+				newGroupEx.RemainingCap = newRemainingCap
+			} else {
+				capacityDiff := newGroupEx.Capacity - oldGroupEx.Capacity
+				newGroupEx.RemainingCap = oldGroupEx.RemainingCap + capacityDiff
+
+				extraCap := int(float64(capacityDiff) * 0.1)
+				newGroupEx.RemainingCap += extraCap
+			}
+		}
+
+		if len(newGroupEx.Blacklist) > 0 {
+			adminAndOwners, err := g.db.FindGroupMemberRoleLevels(ctx, req.GroupID, []int32{constant.GroupAdmin, constant.GroupOwner})
+			if err != nil {
+				return nil, err
+			}
+
+			adminAndOwnerIDs := make(map[string]bool)
+			for _, member := range adminAndOwners {
+				adminAndOwnerIDs[member.UserID] = true
+			}
+
+			for _, userID := range newGroupEx.Blacklist {
+				if adminAndOwnerIDs[userID] {
+					return nil, errs.ErrNoPermission.WrapMsg("cannot add admin or owner to blacklist")
+				}
+			}
+
+			if err := g.userClient.CheckUser(ctx, newGroupEx.Blacklist); err != nil {
+				return nil, err
+			}
+		}
+
+		exBytes, err := json.Marshal(newGroupEx)
+		if err != nil {
+			return nil, err
+		}
+		req.Ex.Value = string(exBytes)
 	}
 
 	count, err := g.db.FindGroupMemberNum(ctx, group.GroupID)
@@ -1230,34 +1426,6 @@ func (g *groupServer) SetGroupInfoEx(ctx context.Context, req *pbgroup.SetGroupI
 	}
 
 	g.webhookAfterSetGroupInfoEx(ctx, &g.config.WebhooksConfig.AfterSetGroupInfoEx, req)
-
-	if group.Ex != "" && req.Ex != nil {
-		oldGroupEx := model.NewGroupEx()
-		if err := json.Unmarshal([]byte(group.Ex), oldGroupEx); err != nil {
-			return nil, errs.ErrArgs.WrapMsg("invalid old group ex format")
-		}
-
-		newGroupEx := model.NewGroupEx()
-		if err := json.Unmarshal([]byte(req.Ex.Value), newGroupEx); err != nil {
-			return nil, errs.ErrArgs.WrapMsg("invalid new group ex format")
-		}
-
-		// 计算容量差值并更新剩余容量
-		if newGroupEx.Capacity != oldGroupEx.Capacity {
-			capacityDiff := newGroupEx.Capacity - oldGroupEx.Capacity
-			newGroupEx.RemainingCap = oldGroupEx.RemainingCap + capacityDiff
-			// 为新容量提供额外10%空间
-			extraCap := int(float64(capacityDiff) * 0.1)
-			newGroupEx.RemainingCap += extraCap
-
-			// 更新Ex字段
-			exBytes, err := json.Marshal(newGroupEx)
-			if err != nil {
-				return nil, err
-			}
-			req.Ex.Value = string(exBytes)
-		}
-	}
 
 	return &pbgroup.SetGroupInfoExResp{}, nil
 }
@@ -1626,6 +1794,43 @@ func (g *groupServer) SetGroupMemberInfo(ctx context.Context, req *pbgroup.SetGr
 		if err != nil {
 			return nil, err
 		}
+
+		group, err := g.db.TakeGroup(ctx, groupID)
+		if err != nil {
+			return nil, err
+		}
+		groupEx := model.NewGroupEx()
+		if group.Ex != "" {
+			if err := json.Unmarshal([]byte(group.Ex), groupEx); err != nil {
+				return nil, errs.ErrArgs.WrapMsg("invalid group ex format")
+			}
+		}
+
+		currentAdmins := 0
+		newAdmins := 0
+		adminMap := make(map[string]bool)
+
+		allMembers, err := g.db.FindGroupMemberRoleLevels(ctx, groupID, []int32{constant.GroupAdmin})
+		if err != nil {
+			return nil, err
+		}
+		currentAdmins = len(allMembers)
+		for _, admin := range allMembers {
+			adminMap[admin.UserID] = true
+		}
+
+		for _, member := range members {
+			if member.RoleLevel != nil && member.RoleLevel.Value == constant.GroupAdmin {
+				if !adminMap[member.UserID] {
+					newAdmins++
+				}
+			}
+		}
+
+		if currentAdmins+newAdmins > groupEx.MaxAdminNum {
+			return nil, errs.ErrNoPermission.WrapMsg(fmt.Sprintf("exceed max admin number limit %d", groupEx.MaxAdminNum))
+		}
+
 		opUserIndex := -1
 		for i, member := range dbMembers {
 			if member.UserID == opUserID {
@@ -1657,9 +1862,9 @@ func (g *groupServer) SetGroupMemberInfo(ctx context.Context, req *pbgroup.SetGr
 						if member.RoleLevel == constant.GroupOwner {
 							return nil, errs.ErrNoPermission.WrapMsg("admin can not change group owner")
 						}
-						if member.RoleLevel == constant.GroupAdmin && member.UserID != opUserID {
-							return nil, errs.ErrNoPermission.WrapMsg("admin can not change other group admin")
-						}
+						// if member.RoleLevel == constant.GroupAdmin && member.UserID != opUserID {
+						// 	return nil, errs.ErrNoPermission.WrapMsg("admin can not change other group admin")
+						// }
 					}
 				case constant.GroupOrdinaryUsers:
 					for _, member := range dbMembers {
@@ -1692,6 +1897,9 @@ func (g *groupServer) SetGroupMemberInfo(ctx context.Context, req *pbgroup.SetGr
 					}
 					if roleLevel == constant.GroupOwner {
 						return nil, errs.ErrArgs.WrapMsg("group owner can not change own role level") // Prevent the absence of a group owner
+					}
+					if roleLevel == constant.GroupAdmin {
+						return nil, errs.ErrNoPermission.WrapMsg("admin can not change own role level")
 					}
 				}
 			}

@@ -117,6 +117,10 @@ func (m *msgServer) messageVerification(ctx context.Context, data *msg.SendMsgRe
 			return servererrs.ErrNotInGroupYet.Wrap()
 		}
 
+		if groupInfo.Status == constant.GroupBanChat {
+			return servererrs.ErrMutedGroup.WrapMsg("群组已被封禁，所有成员均不能发送消息")
+		}
+
 		groupMemberInfo, err := m.GroupLocalCache.GetGroupMember(ctx, data.MsgData.GroupID, data.MsgData.SendID)
 		if err != nil {
 			if errs.ErrRecordNotFound.Is(err) {
